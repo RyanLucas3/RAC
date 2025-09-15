@@ -1,6 +1,6 @@
-# Compression for Reasoning Language Models (ICLR Submission)
+# Compression for Reasoning Language Models (Reasoning-Aware Compression)
 
-This repository contains code accompanying an ICLR submission on compression for open-source reasoning language models.
+This repository contains code on compression for open-source reasoning language models.
 It provides instructions for reproducing results and extending the codebase, including:
 
 1. **Collecting reasoning traces from R1-distilled models**
