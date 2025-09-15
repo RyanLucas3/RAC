@@ -1,0 +1,11 @@
+vllm==0.8.5.2+cu128
+setuptools
+flash-attn
+lighteval
+math_verify
+torch
+triton
+async_lru
+deepspeed==0.16.9
+liger-kernel
+filelock
