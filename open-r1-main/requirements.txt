@@ -1,4 +1,4 @@
-vllm==0.8.5.2+cu128
+vllm
 setuptools
 flash-attn
 lighteval
