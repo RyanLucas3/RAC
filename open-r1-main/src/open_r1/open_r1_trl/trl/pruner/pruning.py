@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from transformers import PreTrainedTokenizerBase
 import transformers
-
+from typing import Iterable, Tuple
 from ..sparsegpt.sparsegpt import SparseGPT
 from ..data_utils import maybe_apply_chat_template
 
@@ -127,6 +127,7 @@ def sparsegpt_prune(
     device: str = "cuda",
     scope: str = "all",
     memory_limit_gb: float = 30.0,
+    thirds_to_prune: Tuple[int, ...] = (1, 2, 3),
 ) -> None:
     """
     Prune with SparseGPT, grouping layers so that the sum of their Hessian
@@ -141,6 +142,14 @@ def sparsegpt_prune(
         and m.weight.requires_grad
         and (scope == "all" or _is_mlp(n))
     ]
+
+    layers_before = len(layers)
+    layers = _subset_by_thirds(layers, thirds_to_prune)
+    print(
+        f"[SparseGPT] pruning thirds {sorted(set(thirds_to_prune))} → "
+        f"{len(layers)}/{layers_before} layers selected"
+    )
+
     print(f"[SparseGPT] total layers eligible: {len(layers)}")
 
     group: list[tuple[str, nn.Module]] = []
@@ -351,10 +360,10 @@ def prune_wanda(model: nn.Module,
     """
     Layer-wise unstructured WANDA pruning.
 
-    • Handles recent Qwen-2 checkpoints (≥ transformers-4.54) that require
-      `position_embeddings=(cos, sin)` in every decoder-layer call.
-    • Avoids Flash-Attention CUDA asserts by always supplying a valid
-      attention-mask (all-ones when the original mask is None).
+    Key change: per-layer tensors (inps/outs/pos_ids/mask and rotary cache)
+    are always moved to the device of the *layer itself*, derived via
+    `next(layer.parameters()).device`. This avoids CPU↔CUDA mismatches that
+    crash fused Liger RMSNorm/Triton kernels.
     """
     # ------------------------------------------------------------------ #
     # 0. setup
@@ -362,27 +371,29 @@ def prune_wanda(model: nn.Module,
     model.eval()
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    DTYPE = next(model.parameters()).dtype
+
+    PARAM0 = next(model.parameters())
+    DTYPE  = PARAM0.dtype
+    MODEL_DEV = PARAM0.device
 
     # ------------------------------------------------------------------ #
     # 1. collect calibration activations
     # ------------------------------------------------------------------ #
     inps, outs, attn_mask, _ = prepare_calibration_input(
         model, calib_loader, device
-    )
+    )  # inps/outs come back on CPU
     inps, outs = inps.to(DTYPE), outs.to(DTYPE)
     nsamp, seq_len, _ = inps.shape
     layers = _get_decoder_layers(model)
 
-    # template tensors shared across calls
-    pos_ids_t = torch.arange(seq_len, dtype=torch.long,
-                             device=inps.device).unsqueeze(0)
+    # template position ids (will be moved per-layer)
+    pos_ids_t = torch.arange(seq_len, dtype=torch.long, device="cpu").unsqueeze(0)
 
-    # model component that actually exposes `rotary_emb`
+    # the module that exposes rotary_emb on Qwen2/Llama-style models
     base_model = getattr(model, "model", model)
 
-    # cache:   device → all-ones mask  (avoids re-allocation each layer)
-    _full_mask_cache: dict[int, torch.Tensor] = {}
+    # cache: device -> all-ones mask to avoid re-allocations
+    _full_mask_cache: dict[torch.device, torch.Tensor] = {}
 
     # ------------------------------------------------------------------ #
     # 2. iterate over transformer blocks
@@ -390,39 +401,38 @@ def prune_wanda(model: nn.Module,
     for i, layer in enumerate(layers):
         subset = find_layers(layer)           # {name: sub-module}
 
-        # (multi-GPU) move buffers to the shard that owns this layer
-        if hasattr(model, "hf_device_map") and f"model.layers.{i}" in model.hf_device_map:
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, pos_ids = inps.to(dev), outs.to(dev), pos_ids_t.to(dev)
-            if attn_mask is not None:
-                attn_mask = attn_mask.to(dev)
-        else:
-            dev, pos_ids = inps.device, pos_ids_t
+        # === robust, always-correct device for THIS layer ===
+        layer_dev: torch.device = next(layer.parameters()).device
+
+        # move our rolling buffers & ids to this layer's device
+        inps  = inps.to(layer_dev, non_blocking=True)
+        outs  = outs.to(layer_dev, non_blocking=True)
+        pos_ids = pos_ids_t.to(layer_dev, non_blocking=True)
 
         # -------- ensure we always pass a legal attention-mask -----------
         if attn_mask is None:
-            mask = _full_mask_cache.get(dev)
+            mask = _full_mask_cache.get(layer_dev)
             if mask is None or mask.shape[1] < seq_len:
-                mask = torch.ones(1, seq_len, dtype=torch.bool, device=dev)
-                _full_mask_cache[dev] = mask
+                mask = torch.ones(1, seq_len, dtype=torch.bool, device=layer_dev)
+                _full_mask_cache[layer_dev] = mask
         else:
-            mask = attn_mask
+            mask = attn_mask.to(layer_dev, non_blocking=True)
         # ----------------------------------------------------------------
 
-        # -------- rotary position embeddings (Qwen-2) --------------------
+        # -------- rotary position embeddings (Qwen-2 / Llama) -----------
         extra_kw = {}
         if hasattr(base_model, "rotary_emb"):
             cache_name = "_wanda_pos_emb"
             cached = getattr(base_model, cache_name, None)
             needs_new = (
                 cached is None
-                or cached[0].device != dev
+                or cached[0].device != layer_dev
                 or cached[0].shape[1] < seq_len
             )
             if needs_new:
                 dummy = torch.zeros(
                     1, seq_len, base_model.config.hidden_size,
-                    dtype=DTYPE, device=dev
+                    dtype=DTYPE, device=layer_dev
                 )
                 setattr(base_model, cache_name,
                         base_model.rotary_emb(dummy, pos_ids))
@@ -455,17 +465,18 @@ def prune_wanda(model: nn.Module,
         # ------------------------------------------------------------------
         for name, sub in subset.items():
             W = sub.weight.data
+            # scaler_row was accumulated on sub.weight.device already
             scaler = torch.sqrt(wrappers[name].scaler_row.reshape(1, -1).to(W.device))
             metric = torch.abs(W) * scaler
 
-            # --- robust k computation -------------------------------------------------
+            # --- robust k computation ------------------------------------
             n_col = metric.size(1)
-            k = int(round(n_col * sparsity))          # round instead of floor
-            if k == 0:                                # nothing to prune → skip layer
-                continue
-            if k >= n_col:                            # keep at least one column
-                k = n_col - 1
-            # -------------------------------------------------------------------------
+            k = int(round(n_col * sparsity))      # round instead of floor
+            if k == 0:
+                continue                          # nothing to prune
+            if k >= n_col:
+                k = n_col - 1                     # keep at least one column
+            # --------------------------------------------------------------
 
             idx = torch.topk(metric, k, dim=1, largest=False, sorted=False).indices
             W.scatter_(1, idx, 0)
@@ -489,6 +500,7 @@ def prune_wanda(model: nn.Module,
     # ------------------------------------------------------------------ #
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+
 
 
 
@@ -597,3 +609,21 @@ class WrappedGPT:
 
         inp = inp.type(torch.float32)
         self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2  / self.nsamples
+
+
+def _subset_by_thirds(items: list, thirds: Iterable[int]) -> list:
+    """
+    Split `items` into 3 contiguous thirds and keep only those indices in `thirds`.
+    Third indices are 1-based: 1 = first third, 2 = second, 3 = last third.
+    """
+    n = len(items)
+    if n == 0:
+        return items
+    a, b = n // 3, (2 * n) // 3
+    buckets = [items[:a], items[a:b], items[b:]]  # 3 contiguous slices
+    keep = set(int(t) for t in thirds if t in (1, 2, 3))
+    out: list = []
+    for i, bucket in enumerate(buckets, start=1):
+        if i in keep:
+            out.extend(bucket)
+    return out

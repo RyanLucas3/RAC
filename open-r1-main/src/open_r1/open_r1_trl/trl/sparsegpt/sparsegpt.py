@@ -221,6 +221,23 @@ class SparseGPT:
                 return
 
             except (RuntimeError, torch._C._LinAlgError) as err:
+
+                # --- extra diagnostics ---
+                try:
+                    eigvals = torch.linalg.eigvalsh(H_orig).float().cpu()
+                    print(f"    min eigval: {eigvals.min().item():.3e}")
+                    print(f"    max eigval: {eigvals.max().item():.3e}")
+                    neg = (eigvals <= 0).sum().item()
+                    print(f"    non-positive eigenvalues: {neg}/{eigvals.numel()}")
+                except Exception as e_diag:
+                    print(f"    (eigenvalue check failed: {e_diag})")
+            
+                diag = torch.diag(H_orig)
+                print(f"    min diag: {diag.min().item():.3e}, max diag: {diag.max().item():.3e}")
+            
+                asym = torch.norm(H_orig - H_orig.T) / torch.norm(H_orig)
+                print(f"    symmetry error ‖H - Hᵀ‖/‖H‖: {asym:.3e}")
+        
                 if "cholesky" not in str(err).lower():
                     raise
                 print(f"[SparseGPT] Cholesky failed (damp={cur_damp:.3f}); retrying…")

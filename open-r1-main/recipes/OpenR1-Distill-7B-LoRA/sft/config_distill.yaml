@@ -1,0 +1,119 @@
+# ──────────────────────────────────────────────────────────────
+# CONFIG: Supervised fine-tuning with LoRA on 8 × H100 (80 GB)
+# ──────────────────────────────────────────────────────────────
+
+# --------------------------------------------------------------
+# 1.  Model arguments
+# --------------------------------------------------------------
+model_name_or_path: open-r1/Qwen2.5-Math-7B-RoPE-300k
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+# --------------------------------------------------------------
+# 2.  Dataset arguments
+# --------------------------------------------------------------
+chat_template: |-
+  {%- if tools %}
+      {{- '<|im_start|>system\n' }}
+      {%- if messages[0]['role'] == 'system' %}
+          {{- messages[0]['content'] }}
+      {%- else %}
+          {{- 'You are Open-R1, a language model trained by Hugging Face to help users. …' }}
+      {%- endif %}
+      {{- "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+      {%- for tool in tools %}
+          {{- "\n" }}{{- tool | tojson }}
+      {%- endfor %}
+      {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+  {%- else %}
+      {%- if messages[0]['role'] == 'system' %}
+          {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}
+      {%- else %}
+          {{- '<|im_start|>system\nYou are Open-R1, a language model trained by Hugging Face to help users. …<|im_end|>\n' }}
+      {%- endif %}
+  {%- endif %}
+  {%- for message in messages %}
+      {%- if (message.role == "user") or (message.role == "system" and not loop.first) or (message.role == "assistant" and not message.tool_calls) %}
+          {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}
+      {%- elif message.role == "assistant" %}
+          {{- '<|im_start|>' + message.role }}
+          {%- if message.content %}{{- '\n' + message.content }}{%- endif %}
+          {%- for tool_call in message.tool_calls %}
+              {%- if tool_call.function is defined %}{%- set tool_call = tool_call.function %}{%- endif %}
+              {{- '\n<tool_call>\n{"name": "' + tool_call.name + '", "arguments": ' + (tool_call.arguments | tojson) + '}\n</tool_call>' }}
+          {%- endfor %}
+          {{- '<|im_end|>\n' }}
+      {%- elif message.role == "tool" %}
+          {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}{{- '<|im_start|>user' }}{%- endif %}
+          {{- '\n<tool_response>\n' + message.content + '\n</tool_response>' }}
+          {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}{{- '<|im_end|>\n' }}{%- endif %}
+      {%- endif %}
+  {%- endfor %}
+  {%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}
+dataset_name: open-r1/Mixture-of-Thoughts
+dataset_config: all
+dataset_num_proc: 12
+
+# --------------------------------------------------------------
+# 3.  PEFT / LoRA adapter
+# --------------------------------------------------------------
+peft_config:
+  peft_type: LORA
+  r: 32
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate
+    - up
+    - down
+  bias: none               # train no bias terms
+  inference_mode: false    # ensure adapters are trainable
+
+# --------------------------------------------------------------
+# 4.  SFT-trainer arguments
+# --------------------------------------------------------------
+bf16: true
+do_eval: false
+eval_strategy: "no"
+
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 8
+
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+max_length: 32768
+packing: false
+max_grad_norm: 0.2
+
+learning_rate: 4.0e-05
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+warmup_ratio: 0.03
+
+num_train_epochs: 5
+max_steps: -1
+
+output_dir: data/OpenR1-Distill-7B
+overwrite_output_dir: true
+hub_model_id: OpenR1-Distill-7B
+hub_strategy: every_save
+push_to_hub: true
+
+log_level: info
+logging_strategy: steps
+logging_steps: 1
+save_strategy: epoch
+save_total_limit: 1
+report_to: [none]
+
+seed: 42
+use_liger_kernel: false

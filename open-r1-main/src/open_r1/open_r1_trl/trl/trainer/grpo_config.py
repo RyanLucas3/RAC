@@ -400,8 +400,10 @@ class GRPOConfig(TrainingArguments):
             default=False,
             metadata={"help": "Whether to run the training loop."},
         )
+    
     # ─────────────────────────────────────────────────────────────────────────────
     # Parameters that control pruning
+    # ─────────────────────────────────────────────────────────────────────────────
 
     prune: bool = field(
         default=False,
@@ -432,7 +434,17 @@ class GRPOConfig(TrainingArguments):
     )
 
     prune_scope: str = field(default="all", metadata={"help": "Pruning scope: 'all' (default) or 'mlp' to prune only MLP/feed‑forward layers."})
-
+    
+    prune_thirds_to_prune: str = field(
+    default="all",
+    metadata={
+        "help": (
+            "Which thirds of the decoder stack to prune. "
+            "Comma-separated list (e.g., '1,2'), single value (e.g., '3'), "
+            "or 'all'. Thirds are 1-based: 1 = first third, 2 = second, 3 = last third."
+        )
+    },
+)
 
     # Parameters controlling quantization
     quantize: bool = field(default=False, metadata={"help": "Enable post-training quantization"})
@@ -561,6 +573,14 @@ class GRPOConfig(TrainingArguments):
                     "`output_dir`, e.g. "
                     "`/…/qwen1.5b_trace_tokens.json`."
         },
+    )
+
+    save_dir: str = field(
+        default="./models",
+       metadata={
+            "help": "Root directory on disk where pruned / quantised checkpoints, "
+                   "trace datasets and other artefacts are written."
+      },
     )
 
     reward_pruning: bool = field(default=False, metadata={"help": "Use reward data during pruning"})

@@ -9,3 +9,4 @@ async_lru
 deepspeed==0.16.9
 liger-kernel
 filelock
+matplotlib

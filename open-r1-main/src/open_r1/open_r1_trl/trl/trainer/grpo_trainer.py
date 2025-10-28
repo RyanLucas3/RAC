@@ -75,6 +75,7 @@ from ..pruner.pruning import (
     sparsegpt_prune,
     compute_sparsity,
     magnitude_prune_layerwise, 
+    prune_wanda
 )
 
 
@@ -423,6 +424,7 @@ python
         # Models
         # Trained model
         model_init_kwargs = args.model_init_kwargs or {}
+        model_init_kwargs.setdefault("trust_remote_code", True)
 
         if isinstance(model, str):
             model_id = model
@@ -443,19 +445,19 @@ python
             )
             model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
 
-            if args.split_base_model and torch.cuda.device_count() > 1:
-                max_mem = {i: args.max_gpu_mem for i in range(torch.cuda.device_count())}
-                device_map = infer_auto_device_map(
-                    model,
-                    max_memory=max_mem,
-                    no_split_module_classes=[
-                        "LlamaDecoderLayer",     
-                        "GPTNeoXLayer",
-                        "GPTJBlock",
-                        "MistralDecoderLayer",
-                    ],
-                )
-                model = dispatch_model(model, device_map)
+            # if args.split_base_model and torch.cuda.device_count() > 1:
+            #     max_mem = {i: args.max_gpu_mem for i in range(torch.cuda.device_count())}
+            #     device_map = infer_auto_device_map(
+            #         model,
+            #         max_memory=max_mem,
+            #         no_split_module_classes=[
+            #             "LlamaDecoderLayer",     
+            #             "GPTNeoXLayer",
+            #             "GPTJBlock",
+            #             "MistralDecoderLayer",
+            #         ],
+            #     )
+            #     model = dispatch_model(model, device_map)
 
 
         else:
@@ -490,19 +492,23 @@ python
             # If PEFT configuration is not provided, create a reference model based on the initial model.
             self.ref_model = create_reference_model(model)
 
-        if args.split_base_model and self.ref_model is not None:
+        if args.split_base_model and torch.cuda.device_count() > 1:
             max_mem = {i: args.max_gpu_mem for i in range(torch.cuda.device_count())}
+            max_mem["cpu"] = getattr(args, "max_cpu_mem", "256GiB")  # allow CPU instead of disk
+        
+            offload_dir = getattr(args, "offload_dir", None) or str(Path(args.save_dir) / ".offload_cache")
+            Path(offload_dir).mkdir(parents=True, exist_ok=True)
+        
             device_map = infer_auto_device_map(
-                self.ref_model,
+                model,
                 max_memory=max_mem,
                 no_split_module_classes=[
-                    "LlamaDecoderLayer",
-                    "GPTNeoXLayer",
-                    "GPTJBlock",
-                    "MistralDecoderLayer",
+                    "LlamaDecoderLayer", "GPTNeoXLayer", "GPTJBlock", "MistralDecoderLayer", "Qwen2DecoderLayer"
                 ],
             )
-            self.ref_model = dispatch_model(self.ref_model, device_map)
+            device_map = {m: ("cpu" if p == "disk" else p) for m, p in device_map.items()}  
+            model = dispatch_model(model, device_map, offload_dir=offload_dir, offload_buffers=True)
+
 
         # Disable dropout in the models
         if args.disable_dropout:
@@ -512,7 +518,7 @@ python
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left", trust_remote_code=True)
         if processing_class.pad_token is None:
             processing_class.pad_token = processing_class.eos_token
 
@@ -668,13 +674,68 @@ python
  
 
 
+        # GPU + CPU budgets
+        max_memory = {i: args.max_gpu_mem for i in range(torch.cuda.device_count())}
+        max_memory["cpu"] = getattr(args, "max_cpu_mem", "256GiB")
+        
+        # Optional NVMe cache (only needed if we truly keep 'disk' in the map)
+        offload_dir = getattr(args, "offload_dir", None)
+        if offload_dir is None:
+            offload_dir = str(Path(getattr(args, "save_dir", getattr(args, "output_dir", "."))) / ".offload_cache")
+        Path(offload_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Plan placements
         device_map = infer_auto_device_map(
             model,
-            max_memory={i: args.max_gpu_mem for i in range(torch.cuda.device_count())},
-            no_split_module_classes=["LlamaDecoderLayer", "GPTNeoXLayer", "GPTJBlock", "MistralDecoderLayer", "Qwen2DecoderLayer"],
-            verbose=True
+            max_memory=max_memory,
+            no_split_module_classes=[
+                "LlamaDecoderLayer", "GPTNeoXLayer", "GPTJBlock", "MistralDecoderLayer", "Qwen2DecoderLayer"
+            ],
+            verbose=True,
         )
-        model = dispatch_model(model, device_map) 
+        
+        # ---- Robustly strip ALL disk-offload placements (across accelerate variants) ----
+        def _to_cpu_if_disk(v):
+            # literal string
+            if v == "disk":
+                return "cpu"
+            # tuples like ("disk", start, end)
+            if isinstance(v, (tuple, list)) and len(v) > 0 and v[0] == "disk":
+                return "cpu"
+            # OffloadIndex / DeviceOffload objects (name varies by version)
+            clsname = getattr(v, "__class__", type(None)).__name__
+            if clsname in ("OffloadIndex", "DeviceOffload", "WeightOffload"):
+                return "cpu"
+            return v
+        
+        device_map = {m: _to_cpu_if_disk(p) for m, p in device_map.items()}
+        
+        # Sanity: if anything still asks for disk, force CPU and warn
+        still_disk = [m for m, p in device_map.items()
+                      if (p == "disk") or (isinstance(p, (tuple, list)) and p and p[0] == "disk")
+                      or (getattr(p, "__class__", type(None)).__name__ in ("OffloadIndex", "DeviceOffload", "WeightOffload"))]
+        if still_disk:
+            print("[warn] device_map still had disk placements; coercing to CPU:", still_disk)
+            for m in still_disk:
+                device_map[m] = "cpu"
+        
+        # # Dispatch. If no 'disk' remains, we *must not* pass offload_dir; older accelerate
+        # # branches complain unnecessarily when offload_dir is given but unused.
+        # if any(p == "disk" for p in device_map.values()):
+        #     model = dispatch_model(
+        #         model,
+        #         device_map,
+        #         offload_dir=offload_dir,          # for NVMe offload
+        #         offload_folder=offload_dir,
+        #         offload_buffers=True,
+        #     )
+        # else:
+        #     model = dispatch_model(
+        #         model,
+        #         device_map,
+        #         offload_buffers=True,
+        #     )
+
 
         super().__init__(
             model=model,
@@ -843,6 +904,20 @@ python
         
         # Pruning
 
+        # Normalize prune_thirds_to_prune into a list of ints
+        s = str(args.prune_thirds_to_prune).strip().lower()
+        if s in ("all", "*", "1,2,3", "1 2 3"):
+            self.prune_thirds_to_prune = [1, 2, 3]
+        else:
+            # Accept both comma and space separated
+            parts = s.replace(",", " ").split()
+            try:
+                self.prune_thirds_to_prune = sorted({int(p) for p in parts if p.strip()})
+            except ValueError:
+                raise ValueError(
+                    f"Invalid prune_thirds_to_prune value: '{self.prune_thirds_to_prune}'"
+                )
+
         # ───────────────────────  One-shot pruning  ───────────────────────
         if args.prune:
 
@@ -865,7 +940,8 @@ python
                     prunen=args.prune_N, # might be None for unstructured
                     prunem=args.prune_M, # might be None for unstructured
                     device="cuda" if torch.cuda.is_available() else "cpu",
-                    scope=args.prune_scope
+                    scope=args.prune_scope,
+                    thirds_to_prune=self.prune_thirds_to_prune
                 )
 
                 print("SparseGPT pruning done")
@@ -905,21 +981,43 @@ python
                     batch_size=args.per_device_train_batch_size,
                 )
 
+            # Build a filesystem-safe tag from the normalized list
+            thirds_list = getattr(self, "prune_thirds_to_prune", None)
+            thirds_tag = "none" if not thirds_list else "_".join(str(t) for t in thirds_list)
+
+            # Also add prune_N and prune_M to the tag
+            nm_tag = f"N{args.prune_N}_M{args.prune_M}" if args.prune_N and args.prune_M else ""
+
             if isinstance(model, str):
-                model_id = model                            # full hub path or local folder
+                _model_id = model
             else:
-                model_id = getattr(model.config, "_name_or_path", "unknown_model")
+                _model_id = getattr(model.config, "_name_or_path", "unknown_model")
 
             dataset_tag = (args.dataset_name or "data").split("/")[-1]
-                
-            save_dir = Path("/shared/public/data/rlucas2") / (f"{Path(model_id).stem}_pruned_{int(args.prune_sparsity*100)}_{args.prune_scope}_tokens{args.prune_calib_tokens}_{dataset_tag}")
+
+            save_dir = (
+                Path(args.save_dir)
+                / (
+                    f"{Path(_model_id).stem}"
+                    f"_pruned_{int(args.prune_sparsity*100)}"
+                    f"_{args.prune_scope}"
+                    f"_tokens{args.prune_calib_tokens}"
+                    f"_prunemethod_{args.pruning_method}"
+                    f"_thirds_{thirds_tag}"
+                    f"_{nm_tag}"     
+                    f"_{dataset_tag}"
+                )
+            )
 
             save_dir.mkdir(parents=True, exist_ok=True)
-
             model.save_pretrained(save_dir, safe_serialization=True)
-            AutoTokenizer.from_pretrained(model_id).save_pretrained(save_dir)
-
+            AutoTokenizer.from_pretrained(_model_id).save_pretrained(save_dir)
             print(f"Pruned model written to {save_dir}")
+
+        masks = {}
+        for n, p in model.named_parameters():
+            if p.ndim == 2 and n.endswith("weight"):
+                masks[n] = (p.data == 0)
 
         if args.quantize:
 
@@ -975,8 +1073,17 @@ python
             else:
                 calib_ds = train_dataset.select(range(n_calib))
 
+            realised = compute_sparsity(model)
+            print(f"Realised sparsity: {realised*100:.2f}%)")
+
+            # re-apply mask
+            if args.prune and args.quantize:
+                for n, p in model.named_parameters():
+                    if n in masks:
+                        p.data[masks[n]] = 0
+                        
             # ── 4. Run one-shot PTQ (SmoothQuant + GPTQ) ───────────────────────────────
-            save_dir = Path("/shared/public/data/rlucas2") / f"{Path(model_id).stem}_quant_{qm.lower()}"
+            save_dir = Path(args.save_dir) / f"{Path(model_id).stem}_quant_{qm.lower()}"
             oneshot(
                 model=self.model,
                 dataset=calib_ds,
@@ -986,8 +1093,7 @@ python
                 num_calibration_samples=len(calib_ds),
             )
             print(f"Checkpoint written to {save_dir}")
-
-
+    
 
 
     def _set_signature_columns_if_needed(self):
@@ -1848,7 +1954,7 @@ python
         dataset_tag = (self.args.dataset_name or "data").split("/")[-1]
 
         # <───  define once, in outer scope  ───>
-        ds_dir = (Path("/shared/public/data/rlucas2") /
+        ds_dir = (Path(self.args.save_dir) /
                 f"dataset_{Path(model_id).stem}_trace_{dataset_tag}")
         
         trace_path = ds_dir.with_suffix(".jsonl")  
@@ -1903,7 +2009,7 @@ python
 
         # ---------------  write raw JSONL trace  ---------------
         trace_path = (
-            Path("/shared/public/data/rlucas2") /
+            Path(self.args.save_dir) /
             f"dataset_{Path(model_id).stem}_trace_{dataset_tag}_.jsonl"
         )
 
@@ -1965,7 +2071,7 @@ python
                 )
 
                 ds_dir = (
-                    Path("/shared/public/data/rlucas2") /
+                    Path(self.args.save_dir) /
                 f"dataset_{Path(model_id).stem}_trace_{dataset_tag}"
                 )
                 ds_dir.mkdir(parents=True, exist_ok=True)

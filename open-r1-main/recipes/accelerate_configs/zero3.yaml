@@ -1,0 +1,41 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+
+distributed_type: DEEPSPEED
+mixed_precision: bf16
+downcast_bf16: "no"
+
+num_machines: 1
+num_processes: 4
+machine_rank: 0
+rdzv_backend: static
+same_network: true
+
+use_cpu: false
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+
+main_training_function: main
+
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+
+  # ───────── ZeRO‑3 core ─────────
+  zero_stage: 3
+  zero3_init_flag: true
+  zero3_save_16bit_model: true
+
+  # ───────── Offload targets ─────
+  offload_param_device: cpu
+  offload_optimizer_device: cpu
+  offload_param_pin_memory: true
+  offload_optimizer_pin_memory: true
+
+  # ───────── Memory tuning ───────
+  reduce_bucket_size: 8000000
+  prefetch_bucket_size: 5000000
+  stage3_param_persistence_threshold: 100000
+  sub_group_size: 1000000
+  overlap_comm: true
+  contiguous_gradients: true
