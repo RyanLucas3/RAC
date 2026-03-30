@@ -33,7 +33,7 @@ Run the following:
 python src/open_r1/grpo.py \
   --config recipes/DeepSeek-R1-Distill-Qwen-1.5B/grpo/config_demo.yaml \
   --model_name_or_path <PATH_TO_MODEL> \
-  --dataset_name <PATH_TO_CODEFORCES_DATASET> \
+  --dataset_name open-r1/codeforces \
   --dataset_prompt_column prompt \
   --save_dir <OUTPUT_DIR> \
   --num_generations 2 \
